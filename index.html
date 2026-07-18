@@ -62,6 +62,9 @@ input,select,textarea{color-scheme:var(--field-scheme)}
 header.top{display:flex;align-items:center;justify-content:space-between;padding:22px 0 6px}
 .logo{font-weight:600;font-size:17px;letter-spacing:.2px;display:flex;align-items:center;gap:10px}
 .logo .dot{width:30px;height:30px;border-radius:10px;background:linear-gradient(135deg,var(--blue-deep),var(--blue-royal));display:grid;place-items:center;font-size:15px}
+.syncpill{font-size:10.5px;font-weight:500;letter-spacing:.02em;padding:3px 9px;border-radius:999px;background:var(--card2);color:var(--t3);white-space:nowrap}
+.syncpill:empty{display:none}
+.syncpill[data-state="error"]{cursor:pointer}
 nav.desk{display:none;gap:4px}
 @media(min-width:900px){nav.desk{display:flex}}
 nav.desk button{padding:9px 16px;border-radius:999px;font-size:13.5px;font-weight:500;color:var(--t2);transition:.15s}
@@ -217,7 +220,7 @@ circle.seg{transition:stroke-dasharray .7s cubic-bezier(.2,.7,.3,1)}
 
 <div class="app">
   <header class="top">
-    <div class="logo"><span class="dot">💰</span>Finance Tracker</div>
+    <div class="logo"><span class="dot">💰</span>Finance Tracker<span id="syncStatus" class="syncpill" onclick="window.__cloudRetry&&window.__cloudRetry()"></span></div>
     <nav class="desk" id="deskNav"></nav>
   </header>
   <div class="period">
@@ -266,10 +269,33 @@ circle.seg{transition:stroke-dasharray .7s cubic-bezier(.2,.7,.3,1)}
   const db = getFirestore(app);
   const provider = new GoogleAuthProvider();
 
+  const LS_KEY = "pfos-v1";
+  const DEBOUNCE_MS = 600;
+
   let currentUser = null;
+  let listeningUid = null;      // uid the active onSnapshot listener belongs to
   let unsubSnapshot = null;
-  let suppressNextSave = false; // avoid re-writing data we just received from the cloud
-  let initialSyncDone = false;  // true once we've pulled the cloud's real data at least once
+  let initialSyncDone = false;  // true once we've read the cloud doc at least once this session
+  let queuedSave = false;       // an edit landed before that first read; resolve it once synced
+  let dirty = false;            // local edits the cloud hasn't confirmed yet
+  let saveTimer = null;
+  let lastPushed = null;        // JSON of the payload the cloud is known to hold
+
+  function syncStatus(state, detail){
+    const el = document.getElementById("syncStatus");
+    if(!el) return;
+    const map = {
+      saving:  ["Saving…", "var(--t3)"],
+      saved:   ["Synced", "var(--ok)"],
+      offline: ["This device only", "var(--warn)"],
+      error:   ["Sync failed — tap to retry", "var(--bad)"]
+    };
+    const [label, color] = map[state] || map.saved;
+    el.textContent = label;
+    el.style.color = color;
+    el.title = detail || label;
+    el.dataset.state = state;
+  }
 
   function authOverlay(show, message){
     const root = document.getElementById("authRoot");
@@ -288,46 +314,155 @@ circle.seg{transition:stroke-dasharray .7s cubic-bezier(.2,.7,.3,1)}
 
   onAuthStateChanged(auth, (user) => {
     currentUser = user;
-    initialSyncDone = false;
+
     if(!user){
-      if(unsubSnapshot) unsubSnapshot();
+      if(unsubSnapshot){ unsubSnapshot(); unsubSnapshot = null; }
+      listeningUid = null;
+      initialSyncDone = false;
+      queuedSave = false;
+      dirty = false;
+      lastPushed = null;
       authOverlay(true);
       return;
     }
-    // Block edits/saves from reaching the cloud until we've loaded the real cloud state at least once,
-    // so a fresh device never overwrites existing data with its empty/local starting state.
+
+    // This fires again for the same account on token refresh and tab focus. Re-running the setup
+    // below would attach a second listener and re-arm the initial-sync guard, which silently
+    // blackholed saves during the window before the new listener's first snapshot arrived.
+    if(listeningUid === user.uid && unsubSnapshot) return;
+
+    if(unsubSnapshot){ unsubSnapshot(); unsubSnapshot = null; }
+    listeningUid = user.uid;
+    initialSyncDone = false;
+    lastPushed = null;
+
+    // Saves are held (not dropped) until the first cloud read lands, so a fresh device can never
+    // overwrite existing cloud data with its empty starting state.
     authOverlay(true, "Loading your data…");
     const ref = doc(db, "financeTrackers", user.uid);
     unsubSnapshot = onSnapshot(ref, (snap) => {
-      if(snap.exists()){
-        suppressNextSave = true;
-        // mutate the existing S object in place (rather than reassigning window.S)
-        // so the app's own `S` variable — which points to the same object — sees the update.
+      // Our own writes echo back locally before the server confirms them. Those snapshots carry
+      // hasPendingWrites=true and hold data we already have, so applying them is pointless.
+      const isLocalEcho = snap.metadata.hasPendingWrites;
+      const firstRead = !initialSyncDone;
+
+      if(snap.exists() && !isLocalEcho){
         const incoming = snap.data().state;
-        for(const k in window.S) delete window.S[k];
-        Object.assign(window.S, incoming);
-        if(typeof window.render === "function") window.render();
-      } else if(!initialSyncDone){
-        // genuinely the first time this account has ever signed in anywhere — nothing to overwrite
-        setDoc(ref, { state: window.S });
+        if(incoming){
+          const incomingJson = JSON.stringify(incoming);
+          // On the first read the cloud is the source of truth. After that, never overwrite edits
+          // this device has made but not yet had confirmed — a slow round-trip can deliver an
+          // older server snapshot after the user has already typed something newer, and blindly
+          // applying it would silently destroy that work.
+          const holdLocalEdits = !firstRead && (dirty || saveTimer);
+          if(holdLocalEdits){
+            if(incomingJson !== JSON.stringify(window.S)) scheduleWrite(); // make sure ours lands
+          } else {
+            if(incomingJson !== JSON.stringify(window.S)){
+              // Mutate the existing object rather than reassigning, so the app's own `S` variable
+              // (which points at the same object) sees the update.
+              for(const k in window.S) delete window.S[k];
+              Object.assign(window.S, incoming);
+              try{ localStorage.setItem(LS_KEY, incomingJson); }catch(e){}
+              if(typeof window.render === "function") window.render();
+            }
+            lastPushed = incomingJson; // the cloud is now known to hold exactly this
+            dirty = false;
+          }
+        }
+      } else if(!snap.exists() && firstRead){
+        // First sign-in for this account anywhere — nothing in the cloud to overwrite, so whatever
+        // is on this device (including an edit made while loading) becomes the starting point.
+        pushNow(true);
       }
-      initialSyncDone = true;
-      authOverlay(false);
+
+      if(firstRead){
+        initialSyncDone = true;
+        authOverlay(false);
+        if(queuedSave){
+          queuedSave = false;
+          if(snap.exists()){
+            // Cloud data won the initial load, so an edit made during loading was intentionally
+            // discarded rather than allowed to overwrite existing data. Say so out loud.
+            if(window.toast) window.toast("Loaded your synced data — an edit made while loading was discarded");
+          } else {
+            pushNow();
+          }
+        }
+      }
+      if(!isLocalEcho) syncStatus(dirty ? "saving" : "saved");
     }, (err) => {
       console.error("sync error", err);
-      initialSyncDone = true; // don't block forever on a permissions/network error
+      initialSyncDone = true; // don't block saves forever on a permissions/network error
       authOverlay(false);
+      syncStatus("error", err.message);
+      if(window.toast) window.toast("Cloud sync error — changes saved on this device");
     });
   });
 
+  function scheduleWrite(){
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => { saveTimer = null; pushNow(); }, DEBOUNCE_MS);
+  }
+
+  function pushNow(force){
+    if(!currentUser){ syncStatus("offline", "Not signed in"); return; }
+    if(!initialSyncDone){ queuedSave = true; return; }
+    const json = JSON.stringify(window.S);
+    if(json === lastPushed && !force){ dirty = false; syncStatus("saved"); return; }
+    syncStatus("saving");
+    setDoc(doc(db, "financeTrackers", currentUser.uid), { state: JSON.parse(json) })
+      .then(() => {
+        lastPushed = json;
+        // Only declare ourselves clean if nothing changed while the write was in flight.
+        if(JSON.stringify(window.S) === json){ dirty = false; syncStatus("saved"); }
+        else { scheduleWrite(); }
+      })
+      .catch(e => {
+        console.error("cloud save failed", e);
+        syncStatus("error", e.message);
+        if(window.toast) window.toast("Couldn't reach the cloud — saved on this device");
+      });
+  }
+
+  // A debounced write can still be waiting when the tab is closed or backgrounded (common on
+  // phones); send it before the page goes away.
+  function flushPending(){
+    if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; pushNow(); }
+  }
+  document.addEventListener("visibilitychange", () => { if(document.visibilityState === "hidden") flushPending(); });
+  window.addEventListener("pagehide", flushPending);
+
   // Exposed so the app's own save() can push to the cloud too.
-  window.__cloudSave = function(state){
-    if(suppressNextSave){ suppressNextSave = false; return; }
-    if(!currentUser) return;
-    if(!initialSyncDone) return; // guard: never push before we know the real cloud state
-    const ref = doc(db, "financeTrackers", currentUser.uid);
-    setDoc(ref, { state }).catch(e => console.error("cloud save failed", e));
+  // Reads window.S directly rather than trusting the argument, so it can never push a stale
+  // snapshot of the state if a caller passes one.
+  window.__cloudSave = function(){
+    if(!currentUser){ syncStatus("offline", "Not signed in — changes stay on this device"); return; }
+    dirty = true; // there is now local work the cloud doesn't have
+    if(!initialSyncDone){
+      // Hold it rather than drop it: the initial-sync guard exists to protect cloud data,
+      // not to discard the user's edits. Resolved as soon as the first snapshot lands.
+      queuedSave = true;
+      syncStatus("saving", "Waiting for the first cloud read");
+      return;
+    }
+    syncStatus("saving");
+    scheduleWrite();
   };
+  window.__cloudRetry = function(){
+    const el = document.getElementById("syncStatus");
+    if(el && el.dataset.state === "error") pushNow(true);
+  };
+  // Quick console check: __syncDebug() shows why a save may not be reaching Firestore.
+  window.__syncDebug = () => ({
+    signedIn: !!currentUser,
+    uid: currentUser ? currentUser.uid : null,
+    listeningUid, initialSyncDone, queuedSave, dirty,
+    writePending: !!saveTimer,
+    cloudBytes: lastPushed ? lastPushed.length : 0,
+    localBytes: JSON.stringify(window.S).length,
+    inSyncWithCloud: lastPushed === JSON.stringify(window.S)
+  });
   window.__signOut = () => signOut(auth);
 </script>
 
@@ -355,6 +490,12 @@ function load(){
 function save(){
   localStorage.setItem(LS,JSON.stringify(S));
   if(window.__cloudSave) window.__cloudSave(S); // push to Firestore so other devices pick it up
+}
+/* Swap the contents of the state object without reassigning it. `S` and `window.S` must keep
+   pointing at the same object or the Firebase sync module ends up reading an orphaned copy. */
+function replaceState(next){
+  for(const k in S) delete S[k];
+  Object.assign(S, next);
 }
 function mkey(y,m){ return y+"-"+String(m+1).padStart(2,"0"); }
 function M(y=S.year,m=S.month){
@@ -759,9 +900,20 @@ function settingsView(){
 function backup(){ dl(new Blob([JSON.stringify(S,null,1)],{type:"application/json"}),"finance-tracker-backup.json"); toast("Backup downloaded"); }
 function restore(inp){
   const f=inp.files[0]; if(!f) return;
-  f.text().then(t=>{ const d=JSON.parse(t); if(!d.months) throw 0; S=d; save(); render(); toast("Backup restored ✓"); }).catch(()=>toast("That file isn't a valid backup"));
+  f.text().then(t=>{ const d=JSON.parse(t); if(!d.months) throw 0; replaceState(d); save(); render(); toast("Backup restored ✓"); }).catch(()=>toast("That file isn't a valid backup"));
 }
-function wipe(){ if(confirm("Erase ALL data on this device? This cannot be undone.")){ localStorage.removeItem(LS); S=load(); render(); toast("All data erased"); } }
+function wipe(){
+  const synced = !!(window.__syncDebug && window.__syncDebug().signedIn);
+  const msg = synced
+    ? "Erase ALL data? You're signed in, so this erases it in the cloud and on your other devices too. This cannot be undone."
+    : "Erase ALL data on this device? This cannot be undone.";
+  if(!confirm(msg)) return;
+  localStorage.removeItem(LS);
+  replaceState(load());
+  save(); // keep local and cloud in step; otherwise the next edit pushes the cleared state anyway
+  render();
+  toast("All data erased");
+}
 
 function monthKeysForRange(mode){
   const keys=[];
