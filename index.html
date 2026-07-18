@@ -269,33 +269,35 @@ circle.seg{transition:stroke-dasharray .7s cubic-bezier(.2,.7,.3,1)}
   let currentUser = null;
   let unsubSnapshot = null;
   let suppressNextSave = false; // avoid re-writing data we just received from the cloud
+  let initialSyncDone = false;  // true once we've pulled the cloud's real data at least once
 
-  function authOverlay(show){
+  function authOverlay(show, message){
     const root = document.getElementById("authRoot");
     if(!show){ root.innerHTML=""; return; }
     root.innerHTML = `
       <div style="position:fixed;inset:0;background:#0B0B0F;z-index:9999;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;font-family:Poppins,sans-serif;color:#fff;">
         <div style="font-size:22px;font-weight:600;">Finance Tracker</div>
-        <div style="opacity:.7;font-size:14px;">Sign in to sync your data across devices</div>
-        <button id="googleSignInBtn" style="padding:12px 24px;border-radius:10px;border:none;background:#fff;color:#111;font-weight:600;font-size:15px;cursor:pointer;">
-          Sign in with Google
-        </button>
+        <div style="opacity:.7;font-size:14px;">${message||"Sign in to sync your data across devices"}</div>
+        ${message?"":'<button id="googleSignInBtn" style="padding:12px 24px;border-radius:10px;border:none;background:#fff;color:#111;font-weight:600;font-size:15px;cursor:pointer;">Sign in with Google</button>'}
       </div>`;
-    document.getElementById("googleSignInBtn").onclick = () => {
+    const btn = document.getElementById("googleSignInBtn");
+    if(btn) btn.onclick = () => {
       signInWithPopup(auth, provider).catch(e => alert("Sign-in failed: " + e.message));
     };
   }
 
   onAuthStateChanged(auth, (user) => {
     currentUser = user;
+    initialSyncDone = false;
     if(!user){
       if(unsubSnapshot) unsubSnapshot();
       authOverlay(true);
       return;
     }
-    authOverlay(false);
+    // Block edits/saves from reaching the cloud until we've loaded the real cloud state at least once,
+    // so a fresh device never overwrites existing data with its empty/local starting state.
+    authOverlay(true, "Loading your data…");
     const ref = doc(db, "financeTrackers", user.uid);
-    // Live-sync: any change made on any signed-in device updates this one automatically.
     unsubSnapshot = onSnapshot(ref, (snap) => {
       if(snap.exists()){
         suppressNextSave = true;
@@ -305,10 +307,16 @@ circle.seg{transition:stroke-dasharray .7s cubic-bezier(.2,.7,.3,1)}
         for(const k in window.S) delete window.S[k];
         Object.assign(window.S, incoming);
         if(typeof window.render === "function") window.render();
-      } else {
-        // first time this user has signed in — push whatever is currently local
+      } else if(!initialSyncDone){
+        // genuinely the first time this account has ever signed in anywhere — nothing to overwrite
         setDoc(ref, { state: window.S });
       }
+      initialSyncDone = true;
+      authOverlay(false);
+    }, (err) => {
+      console.error("sync error", err);
+      initialSyncDone = true; // don't block forever on a permissions/network error
+      authOverlay(false);
     });
   });
 
@@ -316,6 +324,7 @@ circle.seg{transition:stroke-dasharray .7s cubic-bezier(.2,.7,.3,1)}
   window.__cloudSave = function(state){
     if(suppressNextSave){ suppressNextSave = false; return; }
     if(!currentUser) return;
+    if(!initialSyncDone) return; // guard: never push before we know the real cloud state
     const ref = doc(db, "financeTrackers", currentUser.uid);
     setDoc(ref, { state }).catch(e => console.error("cloud save failed", e));
   };
